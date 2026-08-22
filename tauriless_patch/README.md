@@ -1,59 +1,171 @@
 # Tauriless patch stack
 
-This directory documents the changes carried by the `mefistofelix/tao` fork for Tauriless.
-The rest of this repository intentionally keeps the upstream Tao layout unchanged.
+This directory is intentionally identical in the three repositories involved in the Tauriless patch stack:
 
-## Why this fork exists
+- https://github.com/mefistofelix/tauriless
+- https://github.com/mefistofelix/tauri
+- https://github.com/mefistofelix/tao
 
-Tauriless embeds Tauri in a host process that owns the GUI/main thread. The host must be able to enter the native event loop for a bounded amount of time, return control to the host, and call it again later without destroying or recreating the native application state.
+It contains the complete cross-repository explanation plus portable patch snapshots. There is no repository-specific version of this document: starting from any of the three repositories should give the same picture of the whole stack.
 
-Upstream Tao's normal `run` model owns the event loop until application exit, while the existing return-oriented paths do not provide the exact cross-platform repeated bounded-pump contract needed by Tauriless. This fork therefore adds a small desktop API named `EventLoop::run_timeout`.
+## Files
 
-`run_timeout(timeout, handler)` runs native event-loop work, may wait for native work for at most `timeout`, returns early when appropriate, and returns control without treating the slice as application shutdown. Repeated calls must preserve event-loop state.
+- `tao.patch` — the Tao delta required by Tauriless.
+- `tauri.patch` — the Tauri delta required by Tauriless, including the dependency on the patched Tao fork.
+- `README.md` — this document, describing the design, motivation, dependency chain and maintenance procedure.
 
-## The three-repository stack
+The patch files are review/reapplication snapshots. The maintained development sources are the `dev` branches of the Tao and Tauri forks. Do not apply these patches on top of those already-patched branches.
 
-| Repository | Role in the patch stack | Why it is needed |
-| --- | --- | --- |
-| [`mefistofelix/tao`](https://github.com/mefistofelix/tao) | Lowest-level native event-loop patch. Implements `EventLoop::run_timeout` for supported desktop backends. | Native AppKit/Win32/GTK event processing has to be bounded without emitting teardown semantics between slices. |
-| [`mefistofelix/tauri`](https://github.com/mefistofelix/tauri) | Runtime/framework adapter. Its `tauri-runtime-wry` depends on this Tao fork and exposes the bounded pump as `run_timeout`; `App<Wry>` exposes the same operation at the Tauri app level. | Tauriless must pump a real Tauri application, not bypass Tauri's runtime, plugins, IPC, resources, or event translation. |
-| [`mefistofelix/tauriless`](https://github.com/mefistofelix/tauriless) | Consumer/embedding layer. Calls Tauri `App<Wry>::run_timeout` from `tauriless_run(runtime, timeout_ms)` while keeping the host in control of the main thread. | Provides the small C ABI used by native/FFI hosts while retaining normal Tauri behavior. |
+## Why this exists
 
-WRY is deliberately **not forked or patched**. The required behavior belongs to event-loop ownership/pumping in Tao and to the Tauri runtime adapter above it.
+A normal Tauri desktop application owns the native GUI event loop and enters it with a call that does not return until the application exits. That model is correct for a standalone Tauri application, but it does not fit Tauriless.
 
-## Changes carried in this Tao fork
+Tauriless embeds Tauri inside a host runtime that already owns the process and its main thread. Typical hosts are JavaScript runtimes such as Deno, Node.js or Bun using FFI. The host must remain in control of scheduling while still allowing the native windowing stack to process operating-system messages, webview work, tray events, redraws and Tauri events.
 
-The patch is intentionally concentrated around the event loop:
+Running the GUI event loop on a second thread is deliberately avoided. Desktop GUI frameworks have main-thread requirements, especially on macOS, and moving Tauri/Tao to a background GUI thread would create a different and less portable architecture. Tauriless also intentionally avoids Rust calling arbitrary foreign callbacks while the event loop is active.
 
-- `EventLoop::run_timeout(Duration, handler)` is the public desktop entry point.
-- Windows uses a timeout-aware message pump and returns from a slice without running normal loop-destruction/reset behavior.
-- macOS runs a bounded native AppKit slice while preserving callback/application state for the next call.
-- Linux/GTK preserves activation/control-flow state and performs a timeout-aware iteration without tearing down the event-loop state between slices.
-- `examples/run_timeout_probe.rs` exercises repeated timeout slices and native wake-up behavior.
+The required primitive is therefore a bounded native event-loop pump:
 
-The exact implementation evolves with upstream `dev`; this document describes the contract rather than freezing file offsets or a particular SHA.
+1. the host calls Tauriless on the same OS/main thread;
+2. Tauriless asks Tauri to process native events;
+3. Tauri delegates to Tao;
+4. Tao waits for work for at most the requested timeout and drains the ready native work;
+5. control returns to the host;
+6. the host schedules the next slice whenever appropriate.
 
-## Dependency direction
+This keeps one GUI thread, preserves host ownership of scheduling, and allows a timer-driven integration such as repeated ~16 ms calls without creating a second event-loop thread.
 
-The intended dependency direction is strictly:
+## Repository roles
 
-```text
-Tauriless
-    -> mefistofelix/tauri (dev)
-        -> mefistofelix/tao (dev)
-            -> native platform event loops
+### Tao
+
+Tao is where the native bounded event-loop operation is implemented.
+
+The public API added by the patch is conceptually:
+
+```rust
+EventLoop::run_timeout(timeout, event_handler)
 ```
 
-Tao does not depend on Tauri or Tauriless. The cross-links here exist only so someone arriving at this fork can understand why the Tao delta exists and where it is consumed.
+The implementation delegates to platform-specific bounded-return logic on desktop platforms. The patch covers Windows, macOS and Linux and preserves event-loop state across repeated calls instead of treating every slice as final destruction of the loop.
 
-## Upstream synchronization
+Important behavior:
 
-This fork tracks Tao upstream `dev`. When updating it:
+- `Duration::ZERO` provides a non-blocking pump;
+- a positive timeout may wait for native work but never intentionally waits beyond the requested slice;
+- native work can wake the call early;
+- repeated calls continue using the same event loop;
+- a real application exit is still distinguished from a normal slice return.
 
-1. bring the latest upstream `dev` into this fork's `dev` branch;
-2. preserve or adapt the `run_timeout` contract to the current Tao internals;
-3. run `cargo run --example run_timeout_probe` on the supported desktop platforms;
-4. update the Tauri fork so its lock/dependency resolves the new Tao `dev` head;
-5. update Tauriless' Cargo lock and rerun its native/WebView regression tests.
+The patch also contains `examples/run_timeout_probe.rs`, which exercises repeated timeouts and a native/user-event wake.
 
-Do not reintroduce a separate Tauriless patch branch or vendored Tao copy. The maintained patch lives directly on this fork's `dev` branch.
+Patch snapshot base:
+
+- upstream/base Tao commit: `2f9eecf236f4f6a8acfa03329c57039224a3ce99`
+- patched implementation snapshot: `d073951d9ee55eceee16e6088b006420b48e1fb7`
+
+### Tauri
+
+Tauri is the bridge between Tauriless and the patched Tao primitive.
+
+The patch exposes bounded execution through the WRY runtime and through `App<Wry>`:
+
+```rust
+Wry::run_timeout(...)
+App<Wry>::run_timeout(...)
+```
+
+`App<Wry>::run_timeout` performs Tauri setup when required, processes the normal Tauri runtime events, and then returns to the caller after the Tao slice returns.
+
+A repeated bounded run must preserve Tauri's runtime context. The WRY implementation therefore builds the event handler from a cloned shared `Context<T>` rather than consuming or replacing the runtime state between slices.
+
+The Tauri fork also depends directly on the patched Tao `dev` branch. This is intentional: the Tauri patch is not complete if Cargo silently resolves an unpatched crates.io Tao release.
+
+Patch snapshot base:
+
+- upstream/base Tauri commit: `56d19c39e457b528433dc546106cd0bff4066bc2`
+- patched implementation snapshot: `6f6636f13b927cb300a61fedd97f7d89b6651e1a`
+
+### Tauriless
+
+Tauriless is the consumer and the reason for the two upstream deltas.
+
+Tauriless exposes a small C ABI to the host. The host sends Tauri-compatible requests and repeatedly calls:
+
+```c
+tauriless_run(runtime, timeout_ms)
+```
+
+Internally, once the Tauri application exists, this maps the requested timeout to `App<Wry>::run_timeout`. The returned JSON batch contains messages/events accumulated during the slice. No native GUI thread is spawned and Rust does not invoke a foreign event callback from inside the loop.
+
+The host therefore owns the outer scheduling loop while Tao still owns the platform-specific mechanics of pumping Windows/macOS/Linux GUI events.
+
+Tauriless consumes:
+
+- `mefistofelix/tauri` branch `dev`;
+- `mefistofelix/tao` branch `dev` through the patched Tauri dependency and root Cargo patching where required.
+
+Its `Cargo.lock` records the exact resolved commits used by a particular build.
+
+## Dependency chain
+
+```text
+Host runtime (Deno / Node / Bun / native FFI host)
+        |
+        | tauriless_run(timeout_ms)
+        v
+Tauriless
+        |
+        | App<Wry>::run_timeout(...)
+        v
+patched Tauri fork
+        |
+        | Wry::run_timeout(...)
+        v
+patched Tao fork
+        |
+        | platform-specific bounded native event-loop pump
+        v
+Windows / macOS / Linux native GUI event system
+```
+
+## WRY
+
+WRY is not patched by this stack. It remains an upstream dependency. The missing primitive is event-loop ownership/return behavior, which lives in Tao and is surfaced by Tauri; no separate WRY fork is currently required.
+
+## What the two patch files contain
+
+`tao.patch` contains only the Tao source/example delta needed for `run_timeout`. It intentionally excludes this `tauriless_patch/` documentation directory so the patch does not recursively contain itself.
+
+`tauri.patch` contains the Tauri source/dependency/lock delta needed to expose `run_timeout` and resolve the patched Tao fork. It likewise excludes this documentation directory.
+
+Both files were generated as full-index Git diffs and were checked by reverse-applying them against the corresponding patched working trees. This verifies that the snapshots describe the maintained implementation delta.
+
+## Applying the snapshots to clean upstream bases
+
+The maintained forks should normally be used directly. For review, reproduction or reapplication to the recorded bases, the intended order is:
+
+```text
+1. start Tao at the recorded Tao base commit
+2. apply tao.patch
+3. start Tauri at the recorded Tauri base commit
+4. apply tauri.patch
+5. build Tauriless against those patched sources
+```
+
+The Tauri patch refers to the maintained Tao fork `dev`; when reproducing entirely offline or from temporary local clones, that dependency can instead be redirected to the locally patched Tao checkout.
+
+## Updating the stack
+
+When upstream Tao or Tauri advances:
+
+1. update the relevant fork to the desired upstream development commit;
+2. rebase/port the smallest possible Tauriless-specific delta;
+3. verify `run_timeout` semantics on every supported desktop platform;
+4. update Tauri's Tao dependency if the Tao fork head changed;
+5. build and test Tauriless against the resulting Tauri/Tao heads;
+6. regenerate `tao.patch` and/or `tauri.patch` against the new upstream bases;
+7. copy the exact same `tauriless_patch/` directory into all three repositories;
+8. update the recorded base/implementation commit identifiers in this README.
+
+The goal is to keep the patch stack narrow, auditable and easy either to carry temporarily or to upstream later.
