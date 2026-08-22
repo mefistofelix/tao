@@ -231,7 +231,7 @@ impl<T> EventLoop<T> {
 
   /// Runs the native event loop until it becomes idle, waiting at most `timeout` for work.
   #[cfg(not(any(target_os = "ios", target_os = "android")))]
-  pub fn run_for<F>(&mut self, timeout: Duration, event_handler: F) -> i32
+  pub fn run_timeout<F>(&mut self, timeout: Duration, event_handler: F) -> i32
   where
     F: FnMut(Event<'_, T>, &EventLoopWindowTarget<T>, &mut ControlFlow),
   {
