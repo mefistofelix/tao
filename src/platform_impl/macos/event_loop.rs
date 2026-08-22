@@ -12,6 +12,7 @@ use std::{
   panic::{catch_unwind, resume_unwind, RefUnwindSafe, UnwindSafe},
   process, ptr,
   rc::{Rc, Weak},
+  time::Duration,
 };
 
 use crossbeam_channel::{self as channel, Receiver, Sender};
@@ -206,6 +207,21 @@ impl<T> EventLoop<T> {
   where
     F: FnMut(Event<'_, T>, &RootWindowTarget<T>, &mut ControlFlow),
   {
+    self.run_return_inner(None, callback)
+  }
+
+  pub fn run_return_timeout<F>(&mut self, timeout: Duration, callback: F) -> i32
+  where
+    F: FnMut(Event<'_, T>, &RootWindowTarget<T>, &mut ControlFlow),
+  {
+    self.run_return_inner(Some(timeout), callback)
+  }
+
+  fn run_return_inner<F>(&mut self, timeout: Option<Duration>, callback: F) -> i32
+  where
+    F: FnMut(Event<'_, T>, &RootWindowTarget<T>, &mut ControlFlow),
+  {
+    AppState::set_run_timeout(timeout);
     // This transmute is always safe, in case it was reached through `run`, since our
     // lifetime will be already 'static. In other cases caller should ensure that all data
     // they passed to callback will actually outlive it, some apps just can't move
@@ -232,12 +248,20 @@ impl<T> EventLoop<T> {
 
       AppState::set_callback(weak_cb, Rc::clone(&self.window_target));
       let () = msg_send![&app, run];
+      if timeout.is_some() {
+        AppState::clear_run_timeout();
+      }
 
       if let Some(panic) = self.panic_info.take() {
         drop(self._callback.take());
         resume_unwind(panic);
       }
-      AppState::exit()
+      if timeout.is_some() && !AppState::should_exit() {
+        AppState::clear_callback();
+        0
+      } else {
+        AppState::exit()
+      }
     };
     drop(self._callback.take());
 

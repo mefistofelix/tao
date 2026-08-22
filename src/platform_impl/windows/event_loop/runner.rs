@@ -92,6 +92,10 @@ impl<T> EventLoopRunner<T> {
     assert!(old_event_handler.is_none());
   }
 
+  pub(crate) fn clear_event_handler(&self) {
+    self.event_handler.set(None);
+  }
+
   pub(crate) fn reset_runner(&self) {
     let EventLoopRunner {
       thread_msg_target: _,

@@ -13,7 +13,12 @@
 //! [create_proxy]: crate::event_loop::EventLoop::create_proxy
 //! [event_loop_proxy]: crate::event_loop::EventLoopProxy
 //! [send_event]: crate::event_loop::EventLoopProxy::send_event
-use std::{error, fmt, marker::PhantomData, ops::Deref, time::Instant};
+use std::{
+  error, fmt,
+  marker::PhantomData,
+  ops::Deref,
+  time::{Duration, Instant},
+};
 
 use crate::{
   dpi::PhysicalPosition,
@@ -222,6 +227,15 @@ impl<T> EventLoop<T> {
     F: 'static + FnMut(Event<'_, T>, &EventLoopWindowTarget<T>, &mut ControlFlow),
   {
     self.event_loop.run(event_handler)
+  }
+
+  /// Runs the native event loop until it becomes idle, waiting at most `timeout` for work.
+  #[cfg(not(any(target_os = "ios", target_os = "android")))]
+  pub fn run_for<F>(&mut self, timeout: Duration, event_handler: F) -> i32
+  where
+    F: FnMut(Event<'_, T>, &EventLoopWindowTarget<T>, &mut ControlFlow),
+  {
+    self.event_loop.run_return_timeout(timeout, event_handler)
   }
 
   /// Creates an `EventLoopProxy` that can be used to dispatch user events to the main event loop.

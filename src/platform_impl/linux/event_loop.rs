@@ -9,7 +9,7 @@ use std::{
   process,
   rc::Rc,
   sync::atomic::{AtomicBool, Ordering},
-  time::Instant,
+  time::{Duration, Instant},
 };
 
 use cairo::{RectangleInt, Region};
@@ -197,6 +197,8 @@ pub struct EventLoop<T: 'static> {
   draws: crossbeam_channel::Receiver<WindowId>,
   /// Boolean to control device event thread
   run_device_thread: Option<Rc<AtomicBool>>,
+  activated: Cell<bool>,
+  control_flow: Cell<ControlFlow>,
 }
 
 #[derive(Default, Debug, Clone, PartialEq, Eq, Hash)]
@@ -994,6 +996,8 @@ impl<T: 'static> EventLoop<T> {
       events: event_rx,
       draws: draw_rx,
       run_device_thread,
+      activated: Cell::new(false),
+      control_flow: Cell::new(ControlFlow::default()),
     };
 
     Ok(event_loop)
@@ -1037,7 +1041,21 @@ impl<T: 'static> EventLoop<T> {
   ///   current control flow is sent.
   /// - On `EventQueue` to `DrawQueue`, a `MainEventsCleared` event is sent.
   /// - On `DrawQueue` back to `NewStart`, a `RedrawEventsCleared` event is sent.
-  pub(crate) fn run_return<F>(&mut self, mut callback: F) -> i32
+  pub(crate) fn run_return<F>(&mut self, callback: F) -> i32
+  where
+    F: FnMut(Event<'_, T>, &RootELW<T>, &mut ControlFlow),
+  {
+    self.run_return_inner(None, callback)
+  }
+
+  pub(crate) fn run_return_timeout<F>(&mut self, timeout: Duration, callback: F) -> i32
+  where
+    F: FnMut(Event<'_, T>, &RootELW<T>, &mut ControlFlow),
+  {
+    self.run_return_inner(Some(timeout), callback)
+  }
+
+  fn run_return_inner<F>(&mut self, timeout: Option<Duration>, mut callback: F) -> i32
   where
     F: FnMut(Event<'_, T>, &RootELW<T>, &mut ControlFlow),
   {
@@ -1052,12 +1070,14 @@ impl<T: 'static> EventLoop<T> {
 
     context
       .with_thread_default(|| {
-        let mut control_flow = ControlFlow::default();
+        let mut control_flow = self.control_flow.get();
         let window_target = &self.window_target;
         let events = &self.events;
         let draws = &self.draws;
 
-        window_target.p.app.activate();
+        if !self.activated.replace(true) {
+          window_target.p.app.activate();
+        }
 
         // If this is a secondary (remote) GIO instance, the activate signal
         // was forwarded to the primary instance via D-Bus. Exit immediately so
@@ -1068,7 +1088,10 @@ impl<T: 'static> EventLoop<T> {
           return 0;
         }
 
+        let deadline = timeout.map(|timeout| Instant::now() + timeout);
         let mut state = EventState::NewStart;
+        let mut saw_work = false;
+        let mut slice_return = false;
         let exit_code = loop {
           let mut blocking = false;
           match state {
@@ -1079,6 +1102,7 @@ impl<T: 'static> EventLoop<T> {
               }
               ControlFlow::Wait => {
                 if !events.is_empty() {
+                  saw_work = true;
                   callback(
                     Event::NewEvents(StartCause::WaitCancelled {
                       start: Instant::now(),
@@ -1095,6 +1119,7 @@ impl<T: 'static> EventLoop<T> {
               ControlFlow::WaitUntil(requested_resume) => {
                 let start = Instant::now();
                 if start >= requested_resume {
+                  saw_work = true;
                   callback(
                     Event::NewEvents(StartCause::ResumeTimeReached {
                       start,
@@ -1105,6 +1130,7 @@ impl<T: 'static> EventLoop<T> {
                   );
                   state = EventState::EventQueue;
                 } else if !events.is_empty() {
+                  saw_work = true;
                   callback(
                     Event::NewEvents(StartCause::WaitCancelled {
                       start,
@@ -1119,6 +1145,7 @@ impl<T: 'static> EventLoop<T> {
                 }
               }
               _ => {
+                saw_work = true;
                 callback(
                   Event::NewEvents(StartCause::Poll),
                   window_target,
@@ -1133,10 +1160,13 @@ impl<T: 'static> EventLoop<T> {
                 break code;
               }
               _ => match events.try_recv() {
-                Ok(event) => match event {
-                  Event::LoopDestroyed => control_flow = ControlFlow::ExitWithCode(1),
-                  _ => callback(event, window_target, &mut control_flow),
-                },
+                Ok(event) => {
+                  saw_work = true;
+                  match event {
+                    Event::LoopDestroyed => control_flow = ControlFlow::ExitWithCode(1),
+                    _ => callback(event, window_target, &mut control_flow),
+                  }
+                }
                 Err(_) => {
                   callback(Event::MainEventsCleared, window_target, &mut control_flow);
                   state = EventState::DrawQueue;
@@ -1150,6 +1180,7 @@ impl<T: 'static> EventLoop<T> {
               }
               _ => {
                 if let Ok(id) = draws.try_recv() {
+                  saw_work = true;
                   callback(
                     Event::RedrawRequested(RootWindowId(id)),
                     window_target,
@@ -1161,10 +1192,41 @@ impl<T: 'static> EventLoop<T> {
               }
             },
           }
-          gtk::main_iteration_do(blocking);
+          if blocking {
+            if let Some(deadline) = deadline {
+              if context.pending() {
+                gtk::main_iteration_do(false);
+                saw_work = true;
+              } else if saw_work || Instant::now() >= deadline {
+                slice_return = true;
+                break 0;
+              } else {
+                let timed_out = Rc::new(Cell::new(false));
+                let timed_out_ = timed_out.clone();
+                let source = glib::timeout_add_local_once(
+                  deadline.saturating_duration_since(Instant::now()),
+                  move || {
+                    timed_out_.set(true);
+                  },
+                );
+                gtk::main_iteration_do(true);
+                if !timed_out.get() {
+                  source.remove();
+                }
+                saw_work = true;
+              }
+            } else {
+              gtk::main_iteration_do(true);
+            }
+          } else {
+            gtk::main_iteration_do(false);
+          }
         };
-        if let Some(run_device_thread) = run_device_thread {
-          run_device_thread.store(false, Ordering::Relaxed);
+        self.control_flow.set(control_flow);
+        if !slice_return {
+          if let Some(run_device_thread) = run_device_thread {
+            run_device_thread.store(false, Ordering::Relaxed);
+          }
         }
         exit_code
       })

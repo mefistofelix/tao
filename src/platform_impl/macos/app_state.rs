@@ -13,7 +13,7 @@ use std::{
     atomic::{AtomicBool, Ordering},
     Mutex, MutexGuard,
   },
-  time::Instant,
+  time::{Duration, Instant},
 };
 
 use objc2::{msg_send, rc::Retained, runtime::AnyObject as Object};
@@ -57,7 +57,7 @@ impl<'a, Never> Event<'a, Never> {
 pub trait EventHandler: Debug {
   // Not sure probably it should accept Event<'static, Never>
   fn handle_nonuser_event(&mut self, event: Event<'_, Never>, control_flow: &mut ControlFlow);
-  fn handle_user_events(&mut self, control_flow: &mut ControlFlow);
+  fn handle_user_events(&mut self, control_flow: &mut ControlFlow) -> bool;
 }
 
 struct EventLoopHandler<T: 'static> {
@@ -106,9 +106,11 @@ impl<T> EventHandler for EventLoopHandler<T> {
     });
   }
 
-  fn handle_user_events(&mut self, control_flow: &mut ControlFlow) {
+  fn handle_user_events(&mut self, control_flow: &mut ControlFlow) -> bool {
+    let mut handled = false;
     self.with_callback(|this, mut callback| {
       for event in this.window_target.p.receiver.try_iter() {
+        handled = true;
         if let ControlFlow::ExitWithCode(code) = *control_flow {
           let dummy = &mut ControlFlow::ExitWithCode(code);
           (callback)(Event::UserEvent(event), &this.window_target, dummy);
@@ -117,13 +119,22 @@ impl<T> EventHandler for EventLoopHandler<T> {
         }
       }
     });
+    handled
   }
+}
+
+#[derive(Copy, Clone)]
+enum RunTimeout {
+  BeforeWait,
+  AfterWait(Instant),
 }
 
 #[derive(Default)]
 struct Handler {
   ready: AtomicBool,
   in_callback: AtomicBool,
+  slice_work: AtomicBool,
+  run_timeout: Mutex<Option<RunTimeout>>,
   control_flow: Mutex<ControlFlow>,
   control_flow_prev: Mutex<ControlFlow>,
   start_time: Mutex<Option<Instant>>,
@@ -200,6 +211,22 @@ impl Handler {
     self.in_callback.store(in_callback, Ordering::Release);
   }
 
+  fn mark_slice_work(&self) {
+    self.slice_work.store(true, Ordering::Release);
+  }
+
+  fn take_slice_work(&self) -> bool {
+    self.slice_work.swap(false, Ordering::AcqRel)
+  }
+
+  fn run_timeout(&self) -> Option<RunTimeout> {
+    *self.run_timeout.lock().unwrap()
+  }
+
+  fn set_run_timeout(&self, timeout: Option<RunTimeout>) {
+    *self.run_timeout.lock().unwrap() = timeout;
+  }
+
   fn handle_nonuser_event(&self, wrapper: EventWrapper) {
     if let Some(ref mut callback) = *self.callback.lock().unwrap() {
       match wrapper {
@@ -211,9 +238,11 @@ impl Handler {
     }
   }
 
-  fn handle_user_events(&self) {
+  fn handle_user_events(&self) -> bool {
     if let Some(ref mut callback) = *self.callback.lock().unwrap() {
-      callback.handle_user_events(&mut self.control_flow.lock().unwrap());
+      callback.handle_user_events(&mut self.control_flow.lock().unwrap())
+    } else {
+      false
     }
   }
 
@@ -259,6 +288,33 @@ impl Handler {
 pub enum AppState {}
 
 impl AppState {
+  pub fn set_run_timeout(timeout: Option<Duration>) {
+    let timeout = timeout.map(|timeout| {
+      if timeout.is_zero() {
+        RunTimeout::BeforeWait
+      } else {
+        RunTimeout::AfterWait(Instant::now() + timeout)
+      }
+    });
+    HANDLER.set_run_timeout(timeout);
+    if timeout.is_some() {
+      HANDLER.take_slice_work();
+    }
+  }
+
+  pub fn clear_run_timeout() {
+    HANDLER.set_run_timeout(None);
+    HANDLER.waker().stop();
+  }
+
+  pub fn should_exit() -> bool {
+    HANDLER.should_exit()
+  }
+
+  pub fn clear_callback() {
+    HANDLER.callback.lock().unwrap().take();
+  }
+
   pub fn set_callback<T>(
     callback: Weak<RefCell<dyn FnMut(Event<'_, T>, &RootWindowTarget<T>, &mut ControlFlow)>>,
     window_target: Rc<RootWindowTarget<T>>,
@@ -307,10 +363,12 @@ impl AppState {
   }
 
   pub fn open_urls(urls: Vec<url::Url>) {
+    HANDLER.mark_slice_work();
     HANDLER.handle_nonuser_event(EventWrapper::StaticEvent(Event::Opened { urls }));
   }
 
   pub fn reopen(has_visible_windows: bool) {
+    HANDLER.mark_slice_work();
     HANDLER.handle_nonuser_event(EventWrapper::StaticEvent(Event::Reopen {
       has_visible_windows,
     }));
@@ -364,6 +422,7 @@ impl AppState {
   }
 
   pub fn handle_redraw(window_id: WindowId) {
+    HANDLER.mark_slice_work();
     HANDLER.handle_nonuser_event(EventWrapper::StaticEvent(Event::RedrawRequested(window_id)));
   }
 
@@ -390,33 +449,64 @@ impl AppState {
       return;
     }
     HANDLER.set_in_callback(true);
-    HANDLER.handle_user_events();
-    for event in HANDLER.take_events() {
+    let mut slice_work = HANDLER.handle_user_events();
+    slice_work |= HANDLER.take_slice_work();
+    let events = HANDLER.take_events();
+    slice_work |= !events.is_empty();
+    for event in events {
       HANDLER.handle_nonuser_event(event);
     }
     HANDLER.handle_nonuser_event(EventWrapper::StaticEvent(Event::MainEventsCleared));
-    for window_id in HANDLER.should_redraw() {
+    let redraw = HANDLER.should_redraw();
+    slice_work |= !redraw.is_empty();
+    for window_id in redraw {
       HANDLER.handle_nonuser_event(EventWrapper::StaticEvent(Event::RedrawRequested(window_id)));
     }
     HANDLER.handle_nonuser_event(EventWrapper::StaticEvent(Event::RedrawEventsCleared));
     HANDLER.set_in_callback(false);
-    if HANDLER.should_exit() {
+    let should_exit = HANDLER.should_exit();
+    let slice_return = match HANDLER.run_timeout() {
+      Some(RunTimeout::BeforeWait) => true,
+      Some(RunTimeout::AfterWait(deadline)) => slice_work || Instant::now() >= deadline,
+      None => false,
+    };
+    if should_exit || slice_return {
+      if slice_return {
+        HANDLER.waker().stop();
+      }
       unsafe {
         let mtm = MainThreadMarker::new().unwrap();
         let app = NSApp(mtm);
         let _pool = NSAutoreleasePool::new();
         let () = msg_send![&app, stop: nil];
-        // To stop event loop immediately, we need to post some event here.
+        // `stop:` only takes effect once AppKit processes another event.
         post_dummy_event(&app);
       };
+      if slice_return {
+        HANDLER.update_start_time();
+        return;
+      }
     }
     HANDLER.update_start_time();
-    match HANDLER.get_old_and_new_control_flow() {
-      (ControlFlow::ExitWithCode(_), _) | (_, ControlFlow::ExitWithCode(_)) => (),
-      (old, new) if old == new => (),
-      (_, ControlFlow::Wait) => HANDLER.waker().stop(),
-      (_, ControlFlow::WaitUntil(instant)) => HANDLER.waker().start_at(instant),
-      (_, ControlFlow::Poll) => HANDLER.waker().start(),
+    let (old, new) = HANDLER.get_old_and_new_control_flow();
+    if matches!(old, ControlFlow::ExitWithCode(_)) || matches!(new, ControlFlow::ExitWithCode(_)) {
+      return;
+    }
+    if let Some(RunTimeout::AfterWait(run_deadline)) = HANDLER.run_timeout() {
+      let deadline = match new {
+        ControlFlow::Wait => run_deadline,
+        ControlFlow::WaitUntil(deadline) => deadline.min(run_deadline),
+        ControlFlow::Poll => Instant::now(),
+        ControlFlow::ExitWithCode(_) => unreachable!(),
+      };
+      HANDLER.waker().start_at(deadline);
+    } else if old != new {
+      match new {
+        ControlFlow::Wait => HANDLER.waker().stop(),
+        ControlFlow::WaitUntil(instant) => HANDLER.waker().start_at(instant),
+        ControlFlow::Poll => HANDLER.waker().start(),
+        ControlFlow::ExitWithCode(_) => unreachable!(),
+      }
     }
   }
 }

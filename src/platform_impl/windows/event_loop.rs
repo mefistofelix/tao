@@ -227,7 +227,21 @@ impl<T: 'static> EventLoop<T> {
     ::std::process::exit(exit_code);
   }
 
-  pub fn run_return<F>(&mut self, mut event_handler: F) -> i32
+  pub fn run_return<F>(&mut self, event_handler: F) -> i32
+  where
+    F: FnMut(Event<'_, T>, &RootELW<T>, &mut ControlFlow),
+  {
+    self.run_return_inner(None, event_handler)
+  }
+
+  pub fn run_return_timeout<F>(&mut self, timeout: Duration, event_handler: F) -> i32
+  where
+    F: FnMut(Event<'_, T>, &RootELW<T>, &mut ControlFlow),
+  {
+    self.run_return_inner(Some(timeout), event_handler)
+  }
+
+  fn run_return_inner<F>(&mut self, timeout: Option<Duration>, mut event_handler: F) -> i32
   where
     F: FnMut(Event<'_, T>, &RootELW<T>, &mut ControlFlow),
   {
@@ -244,13 +258,41 @@ impl<T: 'static> EventLoop<T> {
     }
 
     let runner = &self.window_target.p.runner_shared;
+    let deadline = timeout.map(|timeout| Instant::now() + timeout);
+    let mut slice_return = false;
 
     let exit_code = unsafe {
       let mut msg = MSG::default();
+      let mut waited = false;
 
       runner.poll();
       'main: loop {
-        if !GetMessageW(&mut msg, None, 0, 0).as_bool() {
+        if let Some(deadline) = deadline {
+          if !PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+            let now = Instant::now();
+            if waited || now >= deadline {
+              slice_return = true;
+              break 'main 0;
+            }
+
+            if MsgWaitForMultipleObjectsEx(
+              None,
+              dur2timeout(deadline - now),
+              QS_ALLEVENTS,
+              MWMO_INPUTAVAILABLE,
+            ) == WAIT_TIMEOUT
+            {
+              slice_return = true;
+              break 'main 0;
+            }
+            waited = true;
+            continue;
+          }
+
+          if msg.message == WM_QUIT {
+            break 'main 0;
+          }
+        } else if !GetMessageW(&mut msg, None, 0, 0).as_bool() {
           break 'main 0;
         }
 
@@ -278,9 +320,18 @@ impl<T: 'static> EventLoop<T> {
     };
 
     unsafe {
-      runner.loop_destroyed();
+      if slice_return {
+        runner.redraw_events_cleared();
+        process_control_flow(runner);
+      } else {
+        runner.loop_destroyed();
+      }
     }
-    runner.reset_runner();
+    if slice_return {
+      runner.clear_event_handler();
+    } else {
+      runner.reset_runner();
+    }
     exit_code
   }
 
